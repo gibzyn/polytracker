@@ -1,6 +1,6 @@
-# polymarket_wallet_monitor.py
 import os
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import requests
@@ -12,11 +12,58 @@ import streamlit as st
 st.set_page_config(page_title="Polymarket Wallet Monitor", page_icon="📈", layout="wide")
 
 DATA_API_BASE = "https://data-api.polymarket.com"
-USER_AGENT = "wallet-monitor/1.8"
-HISTORY_DIR = "wallet_history"
+USER_AGENT = "wallet-monitor/2.0"
+HISTORY_DIR = os.path.join(os.getcwd(), "wallet_history")  # cloud-friendly-ish (still ephemeral on redeploy)
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
+
+# ----------------------------
+# BTC/ETH ONLY FILTER
+# ----------------------------
+BTC_PATTERNS = [r"\bBTC\b", r"\bBITCOIN\b", r"\bXBT\b"]
+ETH_PATTERNS = [r"\bETH\b", r"\bETHEREUM\b"]
+_ALLOWED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (BTC_PATTERNS + ETH_PATTERNS)]
+
+
+def _looks_like_btc_or_eth(text: str) -> bool:
+    if not text:
+        return False
+    s = str(text)
+    return any(p.search(s) for p in _ALLOWED_PATTERNS)
+
+
+def is_btc_or_eth_item(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+
+    fields_to_check = [
+        item.get("marketName"),
+        item.get("title"),
+        item.get("asset"),
+        item.get("question"),
+        item.get("description"),
+        item.get("eventTitle"),
+        item.get("seriesTitle"),
+        item.get("slug"),
+    ]
+
+    # Sometimes "market" is a dict or an id; handle both
+    m = item.get("market")
+    if isinstance(m, str):
+        fields_to_check.append(m)
+    elif isinstance(m, dict):
+        fields_to_check.extend(
+            [m.get("marketName"), m.get("title"), m.get("name"), m.get("ticker"), m.get("symbol"), m.get("slug")]
+        )
+
+    return any(_looks_like_btc_or_eth(v) for v in fields_to_check if v is not None)
+
+
+def filter_payload_btc_eth(payload_list: list) -> list:
+    if not isinstance(payload_list, list):
+        return []
+    return [x for x in payload_list if is_btc_or_eth_item(x)]
 
 
 # ----------------------------
@@ -34,6 +81,16 @@ def fetch_json(url: str, params: dict | None = None, timeout: int = 15):
     r = session.get(url, params=params or {}, timeout=timeout)
     r.raise_for_status()
     return r.json()
+
+
+@st.cache_data(ttl=7)
+def cached_positions(wallet: str):
+    return fetch_json(f"{DATA_API_BASE}/positions", params={"user": wallet})
+
+
+@st.cache_data(ttl=7)
+def cached_trades(wallet: str, trades_param_mode: str, limit: int):
+    return fetch_json(f"{DATA_API_BASE}/trades", params={trades_param_mode: wallet, "limit": limit})
 
 
 def safe_float(x):
@@ -66,15 +123,13 @@ def history_path(wallet: str) -> str:
     return os.path.join(HISTORY_DIR, f"{safe}.csv")
 
 
-def append_history(wallet: str, ts: datetime, portfolio_value: float | None, pnl: float | None, cost_basis: float | None):
+def append_history(wallet: str, ts: datetime, portfolio_value: float | None):
     if portfolio_value is None:
         return
     ensure_dir(HISTORY_DIR)
     row = {
         "timestamp_utc": ts.isoformat(),
         "portfolio_value_usd": portfolio_value,
-        "pnl_usd": pnl if pnl is not None else "",
-        "cost_basis_usd": cost_basis if cost_basis is not None else "",
     }
     path = history_path(wallet)
     df_row = pd.DataFrame([row])
@@ -90,273 +145,162 @@ def load_history(wallet: str) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.read_csv(path)
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], errors="coerce", utc=True)
-    return df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc")
+    df["portfolio_value_usd"] = pd.to_numeric(df.get("portfolio_value_usd"), errors="coerce")
+    df = df.dropna(subset=["timestamp_utc", "portfolio_value_usd"]).sort_values("timestamp_utc")
+    return df
 
 
 # ----------------------------
-# Portfolio metrics + enrichments
+# Portfolio value (robust)
 # ----------------------------
-def compute_portfolio_metrics(df_pos: pd.DataFrame):
-    if df_pos.empty:
-        return None, None, None, None, 0, 0
-
-    size_col = pick_first_existing_col(df_pos, ["size", "positionSize", "shares", "qty"])
-    avg_col = pick_first_existing_col(df_pos, ["avgPrice", "averagePrice", "entryPrice"])
-    cur_col = pick_first_existing_col(df_pos, ["curPrice", "currentPrice", "markPrice", "price"])
-    value_col = pick_first_existing_col(df_pos, ["value", "currentValue", "positionValue", "usdValue", "marketValue"])
-
-    work = df_pos.copy()
-    work["_size"] = work[size_col].apply(safe_float) if size_col else None
-    work["_avg"] = work[avg_col].apply(safe_float) if avg_col else None
-    work["_cur"] = work[cur_col].apply(safe_float) if cur_col else None
-    work["_val"] = work[value_col].apply(safe_float) if value_col else None
-
-    # Treat 0 or negative "curPrice" as missing
-    if "_cur" in work.columns:
-        work.loc[work["_cur"].notna() & (work["_cur"] <= 0), "_cur"] = None
-
-    # Portfolio value: prefer explicit value; else size*cur (only if cur exists)
-    vals = work["_val"].dropna()
-    if not vals.empty:
-        portfolio_value = float(vals.sum())
-    else:
-        tmp = work.dropna(subset=["_size", "_cur"])
-        portfolio_value = float((tmp["_size"] * tmp["_cur"]).sum()) if not tmp.empty else None
-
-    # Cost basis: size * avg
-    tmp2 = work.dropna(subset=["_size", "_avg"])
-    cost_basis = float((tmp2["_size"] * tmp2["_avg"]).sum()) if not tmp2.empty else None
-
-    pnl_est = None
-    pnl_pct = None
-    if portfolio_value is not None and cost_basis is not None and cost_basis != 0:
-        pnl_est = portfolio_value - cost_basis
-        pnl_pct = (pnl_est / cost_basis) * 100.0
-
-    positions_count = int(len(df_pos))
-    market_key = pick_first_existing_col(df_pos, ["conditionId", "condition_id", "marketId", "market"])
-    markets_count = int(df_pos[market_key].nunique()) if market_key else 0
-
-    return portfolio_value, cost_basis, pnl_est, pnl_pct, markets_count, positions_count
-
-
-def add_position_cost_and_value_columns(df_pos: pd.DataFrame) -> pd.DataFrame:
+def compute_positions_value(df_pos_raw: pd.DataFrame) -> float | None:
     """
-    Adds:
-      - cost_paid_usd = size * avgPrice
-      - current_value_usd = value/currentValue if present; else size * curPrice (only if curPrice exists and >0)
-      - pnl_est_usd, pnl_est_pct computed only when current_value_usd is known
-      - missing_mark_price flag when we cannot compute current value
+    Returns best-effort open positions value in USD.
+    Prefer explicit "value/currentValue/usdValue"; else size*curPrice if available.
     """
-    if df_pos.empty:
-        return df_pos
+    if df_pos_raw.empty:
+        return 0.0
 
-    size_col = pick_first_existing_col(df_pos, ["size", "positionSize", "shares", "qty"])
-    avg_col = pick_first_existing_col(df_pos, ["avgPrice", "averagePrice", "entryPrice"])
-    cur_col = pick_first_existing_col(df_pos, ["curPrice", "currentPrice", "markPrice", "price"])
-    value_col = pick_first_existing_col(df_pos, ["value", "currentValue", "positionValue", "usdValue", "marketValue"])
+    size_col = pick_first_existing_col(df_pos_raw, ["size", "positionSize", "shares", "qty"])
+    cur_col = pick_first_existing_col(df_pos_raw, ["curPrice", "currentPrice", "markPrice", "price"])
+    value_col = pick_first_existing_col(df_pos_raw, ["value", "currentValue", "positionValue", "usdValue", "marketValue"])
 
-    work = df_pos.copy()
-    work["_size"] = work[size_col].apply(safe_float) if size_col else None
-    work["_avg"] = work[avg_col].apply(safe_float) if avg_col else None
-    work["_cur"] = work[cur_col].apply(safe_float) if cur_col else None
-    work["_val"] = work[value_col].apply(safe_float) if value_col else None
+    w = df_pos_raw.copy()
 
-    # Treat 0/negative current prices as missing
-    if "_cur" in work.columns:
-        work.loc[work["_cur"].notna() & (work["_cur"] <= 0), "_cur"] = None
+    # 1) Explicit values
+    if value_col and value_col in w.columns:
+        vals = w[value_col].apply(safe_float).dropna()
+        if not vals.empty:
+            return float(vals.sum())
 
-    # Cost paid
-    work["cost_paid_usd"] = (work["_size"] * work["_avg"]) if (size_col and avg_col) else None
-
-    # Current value: prefer explicit value/currentValue; else size * current price if present
-    if value_col:
-        work["current_value_usd"] = work["_val"]
-    else:
-        if size_col and cur_col:
-            work["current_value_usd"] = None
-            m_cur = work["_size"].notna() & work["_cur"].notna()
-            work.loc[m_cur, "current_value_usd"] = work.loc[m_cur, "_size"] * work.loc[m_cur, "_cur"]
-        else:
-            work["current_value_usd"] = None
-
-    # Only compute PnL when current_value_usd is known
-    work["pnl_est_usd"] = None
-    work["pnl_est_pct"] = None
-    m = work["current_value_usd"].notna() & work["cost_paid_usd"].notna() & (work["cost_paid_usd"] != 0)
-    work.loc[m, "pnl_est_usd"] = work.loc[m, "current_value_usd"] - work.loc[m, "cost_paid_usd"]
-    work.loc[m, "pnl_est_pct"] = (work.loc[m, "pnl_est_usd"] / work.loc[m, "cost_paid_usd"]) * 100.0
-
-    # Flag missing marks
-    work["missing_mark_price"] = work["current_value_usd"].isna()
-
-    # Round for display
-    for c in ["cost_paid_usd", "current_value_usd", "pnl_est_usd", "pnl_est_pct"]:
-        if c in work.columns:
-            work[c] = pd.to_numeric(work[c], errors="coerce").round(4)
-
-    work.drop(columns=[c for c in ["_size", "_avg", "_cur", "_val"] if c in work.columns], inplace=True)
-    return work
-
-
-def hedged_condition_ids_from_positions(df_pos: pd.DataFrame) -> set[str]:
-    if df_pos.empty:
-        return set()
-    cond_col = pick_first_existing_col(df_pos, ["conditionId", "condition_id", "marketId", "market"])
-    out_col = pick_first_existing_col(df_pos, ["outcome", "outcomeName", "sideLabel"])
-    size_col = pick_first_existing_col(df_pos, ["size", "positionSize", "shares", "qty"])
-    if not cond_col or not out_col or not size_col:
-        return set()
-
-    w = df_pos.copy()
-    w["_cond"] = w[cond_col].astype(str)
-    w["_out"] = w[out_col].astype(str).str.strip()
-    w["_size"] = w[size_col].apply(safe_float)
-    w = w.dropna(subset=["_size"])
-    if w.empty:
-        return set()
-    return set(w.groupby("_cond")["_out"].nunique()[lambda s: s >= 2].index.tolist())
-
-
-def build_hedge_table(df_pos: pd.DataFrame, fee_buffer: float) -> pd.DataFrame:
-    if df_pos.empty:
-        return pd.DataFrame()
-
-    cond_col = pick_first_existing_col(df_pos, ["conditionId", "condition_id", "marketId", "market"])
-    out_col = pick_first_existing_col(df_pos, ["outcome", "outcomeName", "sideLabel"])
-    size_col = pick_first_existing_col(df_pos, ["size", "positionSize", "shares", "qty"])
-    avg_col = pick_first_existing_col(df_pos, ["avgPrice", "averagePrice", "entryPrice"])
-    cur_col = pick_first_existing_col(df_pos, ["curPrice", "currentPrice", "markPrice", "price"])
-    name_col = pick_first_existing_col(df_pos, ["marketName", "title", "market"])
-
-    if not cond_col or not out_col or not size_col:
-        return pd.DataFrame()
-
-    w = df_pos.copy()
-    w["_cond"] = w[cond_col].astype(str)
-    w["_out"] = w[out_col].astype(str).str.strip()
-    w["_size"] = w[size_col].apply(safe_float)
-    w["_avg"] = w[avg_col].apply(safe_float) if avg_col else None
-    w["_cur"] = w[cur_col].apply(safe_float) if cur_col else None
-    w["_name"] = w[name_col].astype(str) if name_col else w["_cond"]
-
-    # Treat 0/negative current prices as missing
-    if "_cur" in w.columns:
+    # 2) size * current price
+    if size_col and cur_col and (size_col in w.columns) and (cur_col in w.columns):
+        w["_size"] = w[size_col].apply(safe_float)
+        w["_cur"] = w[cur_col].apply(safe_float)
         w.loc[w["_cur"].notna() & (w["_cur"] <= 0), "_cur"] = None
+        tmp = w.dropna(subset=["_size", "_cur"])
+        if not tmp.empty:
+            return float((tmp["_size"] * tmp["_cur"]).sum())
 
-    w = w.dropna(subset=["_size"])
-    if w.empty:
-        return pd.DataFrame()
+    # 3) Unknown
+    return None
 
-    rows = []
-    for cond, g in w.groupby("_cond"):
-        g2 = g[g["_size"].abs() > 1e-9].copy()
-        outs = sorted(g2["_out"].unique().tolist())
-        if len(outs) < 2:
-            continue
 
-        g2 = g2.sort_values("_size", ascending=False)
-        top = g2.head(2)
+def enrich_positions_table(df_pos_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Display-only: adds current_value_usd when possible and a missing flag.
+    No scary PnL math here.
+    """
+    if df_pos_raw.empty:
+        return df_pos_raw
 
-        two_outcome_market = (g2["_out"].nunique() == 2) and (len(top) == 2)
+    size_col = pick_first_existing_col(df_pos_raw, ["size", "positionSize", "shares", "qty"])
+    cur_col = pick_first_existing_col(df_pos_raw, ["curPrice", "currentPrice", "markPrice", "price"])
+    value_col = pick_first_existing_col(df_pos_raw, ["value", "currentValue", "positionValue", "usdValue", "marketValue"])
 
-        avg_sum = None
-        cur_sum = None
-        locked_arb_like = None
-        arb_opportunity_now = None
+    w = df_pos_raw.copy()
 
-        if two_outcome_market:
-            a1 = safe_float(top["_avg"].iloc[0]) if avg_col else None
-            a2 = safe_float(top["_avg"].iloc[1]) if avg_col else None
-            c1 = safe_float(top["_cur"].iloc[0]) if cur_col else None
-            c2 = safe_float(top["_cur"].iloc[1]) if cur_col else None
+    if value_col:
+        w["current_value_usd"] = w[value_col].apply(safe_float)
+    else:
+        w["current_value_usd"] = None
+        if size_col and cur_col:
+            w["_size"] = w[size_col].apply(safe_float)
+            w["_cur"] = w[cur_col].apply(safe_float)
+            w.loc[w["_cur"].notna() & (w["_cur"] <= 0), "_cur"] = None
+            m = w["_size"].notna() & w["_cur"].notna()
+            w.loc[m, "current_value_usd"] = w.loc[m, "_size"] * w.loc[m, "_cur"]
+            w.drop(columns=["_size", "_cur"], inplace=True, errors="ignore")
 
-            if a1 is not None and a2 is not None:
-                avg_sum = a1 + a2
-                locked_arb_like = avg_sum < (1.0 - fee_buffer)
-
-            if c1 is not None and c2 is not None:
-                cur_sum = c1 + c2
-                arb_opportunity_now = cur_sum < (1.0 - fee_buffer)
-
-        rows.append(
-            {
-                "market_label": g2["_name"].iloc[0],
-                "condition_or_market": cond,
-                "outcomes_held": ", ".join(outs),
-                "two_outcome_market": two_outcome_market,
-                "avg_sum_top2": round(avg_sum, 6) if isinstance(avg_sum, (int, float)) else None,
-                "cur_sum_top2": round(cur_sum, 6) if isinstance(cur_sum, (int, float)) else None,
-                "locked_arb_like": locked_arb_like,
-                "arb_opportunity_now": arb_opportunity_now,
-                "fee_buffer": fee_buffer,
-            }
-        )
-
-    return pd.DataFrame(rows)
+    w["missing_mark_or_value"] = w["current_value_usd"].isna()
+    w["current_value_usd"] = pd.to_numeric(w["current_value_usd"], errors="coerce").round(4)
+    return w
 
 
 # ----------------------------
-# Styling (GREEN good / RED bad)
+# History-based P/L (Option 1)
 # ----------------------------
-def style_positions(df: pd.DataFrame):
+def timeframe_start(ts_now: datetime, tf: str) -> datetime | None:
+    if tf == "1D":
+        return ts_now - timedelta(days=1)
+    if tf == "1W":
+        return ts_now - timedelta(weeks=1)
+    if tf == "1M":
+        return ts_now - timedelta(days=30)
+    if tf == "ALL":
+        return None
+    return ts_now - timedelta(days=1)
+
+
+def compute_pl_from_history(hist: pd.DataFrame, now_value: float | None, ts_now: datetime, tf: str):
     """
-    Entire row:
-      - GREEN if pnl_est_usd > 0
-      - RED if pnl_est_usd < 0
-      - NEUTRAL if pnl_est_usd is missing (e.g., missing mark price)
+    Profit/Loss over timeframe = now_value - value_at_or_before(start_time)
+    Uses nearest snapshot at/before start_time. If none exists, uses earliest available.
     """
-    if df.empty or "pnl_est_usd" not in df.columns:
-        return df.style
+    if now_value is None or hist.empty:
+        return None, None  # (pl_usd, anchor_value)
 
-    def row_style(row):
-        v = safe_float(row.get("pnl_est_usd", None))
-        if v is None:
-            return [""] * len(row)
-        if v > 0:
-            return ["background-color: #0b3d0b; color: #eaffea"] * len(row)
-        if v < 0:
-            return ["background-color: #4b0b0b; color: #ffecec"] * len(row)
-        return [""] * len(row)
+    start = timeframe_start(ts_now, tf)
+    if start is None:
+        anchor_row = hist.iloc[0]
+        anchor_value = float(anchor_row["portfolio_value_usd"])
+        return now_value - anchor_value, anchor_value
 
-    return df.style.apply(row_style, axis=1)
+    # snapshots at/before start
+    subset = hist[hist["timestamp_utc"] <= start]
+    if not subset.empty:
+        anchor_row = subset.iloc[-1]
+    else:
+        # no snapshot that old; fall back to earliest we have
+        anchor_row = hist.iloc[0]
+
+    anchor_value = float(anchor_row["portfolio_value_usd"])
+    return now_value - anchor_value, anchor_value
 
 
-def style_hedges(df: pd.DataFrame):
-    if df.empty:
-        return df.style
-
-    def row_style(row):
-        locked_ok = row.get("locked_arb_like", None) is True
-        now_ok = row.get("arb_opportunity_now", None) is True
-        two_outcome = row.get("two_outcome_market", None) is True
-
-        if locked_ok or now_ok:
-            return ["background-color: #0b3d0b; color: #eaffea"] * len(row)
-        if two_outcome and (row.get("locked_arb_like", None) is False) and (row.get("arb_opportunity_now", None) is False):
-            return ["background-color: #4b0b0b; color: #ffecec"] * len(row)
-        return [""] * len(row)
-
-    return df.style.apply(row_style, axis=1)
+def biggest_win_from_history(hist: pd.DataFrame) -> float | None:
+    """
+    "Biggest Win" proxy: biggest positive jump between consecutive snapshots.
+    """
+    if hist is None or hist.empty or len(hist) < 2:
+        return None
+    diffs = hist["portfolio_value_usd"].diff()
+    if diffs.notna().any():
+        mx = diffs.max()
+        if pd.isna(mx):
+            return None
+        return float(mx) if mx > 0 else 0.0
+    return None
 
 
 # ----------------------------
 # UI
 # ----------------------------
-st.title("📈 Polymarket Wallet Monitor")
-st.caption("Includes Hedge Verification table to prove whether multi-outcome positions exist.")
+st.title("📈 Polymarket Wallet Monitor (BTC/ETH Only)")
+st.caption("Accurate tracking via portfolio value change (no scary lifetime PnL guesses).")
 
 with st.sidebar:
     wallet = st.text_input("Wallet address (0x...)", value="", placeholder="0x1234...")
-    refresh_seconds = st.slider("Auto refresh (seconds)", 2, 60, 5)
     trades_limit = st.slider("Recent trades to show", 10, 500, 150)
     trades_param_mode = st.selectbox("Trades API param", ["user", "proxyWallet"], index=0)
-    fee_buffer = st.slider("Hedge/arb fee buffer", 0.0, 0.10, 0.02, step=0.005)
+    auto_refresh = st.toggle("Auto refresh", value=False)
+    refresh_seconds = st.slider("Auto refresh (seconds)", 5, 120, 15)
     show_raw = st.toggle("Show raw JSON (debug)", value=False)
-    run = st.toggle("Run", value=False)
 
-if not run:
-    st.info("Turn on **Run** in the sidebar.")
+    fetch_clicked = st.button("Fetch / Refresh")
+
+# Gate fetch: either user clicks, or auto refresh tick fires
+if auto_refresh:
+    try:
+        st.autorefresh(interval=refresh_seconds * 1000, key="pm_refresh")
+        should_run = True
+    except Exception:
+        should_run = fetch_clicked
+else:
+    should_run = fetch_clicked
+
+if not should_run:
+    st.info("Click **Fetch / Refresh** to load the wallet.")
     st.stop()
 
 wallet = wallet.strip()
@@ -364,21 +308,16 @@ if not wallet.startswith("0x") or len(wallet) < 10:
     st.warning("Enter a valid wallet address like `0x...`")
     st.stop()
 
-# Auto-refresh without while True
-try:
-    st.autorefresh(interval=refresh_seconds * 1000, key="pm_refresh")
-except Exception:
-    pass
-
 ts = now_utc()
 
 # ----------------------------
-# Positions fetch
+# Fetch + filter
 # ----------------------------
-positions_payload = []
 positions_error = None
+trades_error = None
+
 try:
-    positions_payload = fetch_json(f"{DATA_API_BASE}/positions", params={"user": wallet})
+    positions_payload = cached_positions(wallet)
 except Exception as e:
     positions_error = str(e)
     positions_payload = []
@@ -386,119 +325,119 @@ except Exception as e:
 if isinstance(positions_payload, dict) and "data" in positions_payload:
     positions_payload = positions_payload["data"]
 
+positions_payload = filter_payload_btc_eth(positions_payload)
+
+try:
+    trades_payload = cached_trades(wallet, trades_param_mode, trades_limit)
+except Exception as e:
+    trades_error = str(e)
+    trades_payload = []
+
+if isinstance(trades_payload, dict) and "data" in trades_payload:
+    trades_payload = trades_payload["data"]
+
+trades_payload = filter_payload_btc_eth(trades_payload)
+
 df_pos_raw = pd.DataFrame(positions_payload) if positions_payload else pd.DataFrame()
-df_pos = add_position_cost_and_value_columns(df_pos_raw)
+df_pos_view = enrich_positions_table(df_pos_raw)
 
-portfolio_value, cost_basis, pnl_est, pnl_pct, markets_count, positions_count = compute_portfolio_metrics(df_pos_raw)
+# Portfolio value NOW (positions value)
+positions_value_now = compute_positions_value(df_pos_raw)
+if positions_value_now is not None:
+    append_history(wallet, ts, positions_value_now)
 
-append_history(wallet, ts, portfolio_value, pnl_est, cost_basis)
 hist = load_history(wallet)
 
 # ----------------------------
-# Overview
+# Header metrics (like screenshot vibe)
 # ----------------------------
-st.markdown("## Overview")
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Portfolio Value", f"${portfolio_value:,.2f}" if portfolio_value is not None else "N/A")
-c2.metric("Est. PnL", f"${pnl_est:,.2f}" if pnl_est is not None else "N/A")
-c3.metric("Est. PnL %", f"{pnl_pct:,.2f}%" if pnl_pct is not None else "N/A")
-c4.metric("Markets", f"{markets_count}")
-c5.metric("Last Refresh", now_utc_str())
-
-if positions_error:
-    st.warning(f"Positions fetch issue: {positions_error}")
-
-# ----------------------------
-# Historical
-# ----------------------------
-st.markdown("## Historical")
-if not hist.empty and "portfolio_value_usd" in hist.columns:
-    hp = hist.copy()
-    hp["portfolio_value_usd"] = pd.to_numeric(hp["portfolio_value_usd"], errors="coerce")
-    if "pnl_usd" in hp.columns:
-        hp["pnl_usd"] = pd.to_numeric(hp["pnl_usd"], errors="coerce")
-    hp = hp.dropna(subset=["timestamp_utc", "portfolio_value_usd"]).set_index("timestamp_utc")
-    st.line_chart(hp[["portfolio_value_usd"]], height=210)
-    if "pnl_usd" in hp.columns and hp["pnl_usd"].notna().any():
-        st.line_chart(hp[["pnl_usd"]], height=210)
-else:
-    st.caption("History charts will fill after a few refreshes (stored in wallet_history/).")
-
-# ----------------------------
-# Hedge Verification (proof)
-# ----------------------------
-st.markdown("## Hedge Verification (Proof)")
-if df_pos_raw.empty:
-    st.info("No positions returned, nothing to verify.")
-else:
-    cond_col_v = pick_first_existing_col(df_pos_raw, ["conditionId", "condition_id", "marketId", "market"])
-    out_col_v = pick_first_existing_col(df_pos_raw, ["outcome", "outcomeName", "sideLabel"])
-    size_col_v = pick_first_existing_col(df_pos_raw, ["size", "positionSize", "shares", "qty"])
-
-    st.write("Detected columns:", {"condition": cond_col_v, "outcome": out_col_v, "size": size_col_v})
-
-    if not cond_col_v or not out_col_v:
-        st.warning("Can't verify hedges: missing condition/market id and/or outcome fields.")
+# predictions: count unique markets traded (in the current fetched window)
+predictions_count = 0
+if trades_payload:
+    df_t_tmp = pd.DataFrame(trades_payload)
+    mk = pick_first_existing_col(df_t_tmp, ["conditionId", "condition_id", "marketId", "market"])
+    if mk:
+        predictions_count = int(df_t_tmp[mk].astype(str).nunique())
     else:
-        v = df_pos_raw.copy()
-        v["_cond"] = v[cond_col_v].astype(str)
-        v["_out"] = v[out_col_v].astype(str).str.strip()
-        if size_col_v:
-            v["_size"] = v[size_col_v].apply(safe_float)
-        else:
-            v["_size"] = 1.0
+        predictions_count = int(len(df_t_tmp))
 
-        summary = (
-            v.groupby("_cond")
-            .agg(
-                outcomes_held=("_out", lambda s: sorted(set(s))),
-                outcome_count=("_out", "nunique"),
-                total_rows=("_out", "size"),
-                total_abs_size=("_size", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).abs().sum())),
-            )
-            .reset_index()
-            .rename(columns={"_cond": "condition_or_market"})
-            .sort_values(["outcome_count", "total_rows"], ascending=False)
-        )
+biggest_win = biggest_win_from_history(hist)
 
-        st.write("Top conditions by outcome_count:")
-        st.dataframe(summary.head(50), use_container_width=True, hide_index=True)
+# timeframe buttons
+tf_cols = st.columns([3, 1, 1, 1, 1])
+with tf_cols[0]:
+    st.subheader("Dashboard")
+with tf_cols[1]:
+    tf_1d = st.button("1D")
+with tf_cols[2]:
+    tf_1w = st.button("1W")
+with tf_cols[3]:
+    tf_1m = st.button("1M")
+with tf_cols[4]:
+    tf_all = st.button("ALL")
 
-        hedged = summary[summary["outcome_count"] >= 2].copy()
-        if hedged.empty:
-            st.success("✅ Verified: no condition/market has 2+ distinct outcomes in CURRENT positions snapshot.")
-        else:
-            st.error("⚠️ Found possible hedges (2+ outcomes held in same condition/market):")
-            st.dataframe(hedged, use_container_width=True, hide_index=True)
+# store selected timeframe in session
+if "tf" not in st.session_state:
+    st.session_state["tf"] = "1D"
+if tf_1d:
+    st.session_state["tf"] = "1D"
+elif tf_1w:
+    st.session_state["tf"] = "1W"
+elif tf_1m:
+    st.session_state["tf"] = "1M"
+elif tf_all:
+    st.session_state["tf"] = "ALL"
+
+tf = st.session_state["tf"]
+
+pl_usd, anchor_value = compute_pl_from_history(hist, positions_value_now, ts, tf)
+
+# Top row: profile-ish summary + P/L card
+left, right = st.columns([1.2, 1.8], vertical_alignment="top")
+
+with left:
+    st.markdown("### Wallet")
+    st.code(wallet, language=None)
+    st.caption(f"Last refresh: {now_utc_str()}")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Positions Value", f"${positions_value_now:,.2f}" if positions_value_now is not None else "N/A")
+    m2.metric("Biggest Win", f"${biggest_win:,.2f}" if biggest_win is not None else "N/A")
+    m3.metric("Predictions", f"{predictions_count}")
+
+    if positions_error:
+        st.warning(f"Positions fetch issue: {positions_error}")
+    if trades_error:
+        st.warning(f"Trades fetch issue: {trades_error}")
+
+with right:
+    st.markdown(f"### Profit / Loss ({tf})")
+    if pl_usd is None:
+        st.metric("P/L", "N/A")
+        st.caption("Not enough history yet. Click refresh a few times over time to build snapshots.")
+    else:
+        st.metric("P/L", f"${pl_usd:,.2f}")
+        if anchor_value is not None:
+            st.caption(f"Computed as: value now − value at start of window (anchor ${anchor_value:,.2f}).")
+
+    # Chart: portfolio value over selected window
+    if not hist.empty:
+        chart = hist.copy().set_index("timestamp_utc")
+        start = timeframe_start(ts, tf)
+        if start is not None:
+            chart = chart[chart.index >= start]
+        st.line_chart(chart[["portfolio_value_usd"]], height=220)
+    else:
+        st.caption("History will appear after first snapshot is saved.")
+
+st.divider()
 
 # ----------------------------
-# Hedges + arb-like
+# Positions table (no PnL)
 # ----------------------------
-st.markdown("## Hedges / Arb-like (2-outcome markets)")
-hedge_df = build_hedge_table(df_pos_raw, fee_buffer=fee_buffer)
-if hedge_df.empty:
-    st.info("No hedge structures detected (no markets with multiple outcomes held).")
-else:
-    show_cols = [
-        "market_label",
-        "outcomes_held",
-        "two_outcome_market",
-        "avg_sum_top2",
-        "cur_sum_top2",
-        "locked_arb_like",
-        "arb_opportunity_now",
-        "fee_buffer",
-    ]
-    show_cols = [c for c in show_cols if c in hedge_df.columns]
-    view = hedge_df[show_cols].copy()
-    st.dataframe(style_hedges(view), use_container_width=True, hide_index=True)
-
-# ----------------------------
-# Positions
-# ----------------------------
-st.markdown("## Positions (Cost vs Value)")
-if df_pos.empty:
-    st.warning("No positions returned.")
+st.markdown("## Positions (BTC/ETH only)")
+if df_pos_view.empty:
+    st.info("No BTC/ETH positions returned.")
 else:
     preferred_cols = [
         "marketName",
@@ -508,61 +447,32 @@ else:
         "asset",
         "outcome",
         "size",
-        "avgPrice",
         "curPrice",
-        "cost_paid_usd",
         "current_value_usd",
-        "pnl_est_usd",
-        "pnl_est_pct",
-        "missing_mark_price",
+        "missing_mark_or_value",
         "updatedAt",
     ]
-    cols = [c for c in preferred_cols if c in df_pos.columns]
-    pos_view = df_pos[cols].copy() if cols else df_pos.copy()
-    st.dataframe(style_positions(pos_view), use_container_width=True, hide_index=True)
+    cols = [c for c in preferred_cols if c in df_pos_view.columns]
+    view = df_pos_view[cols].copy() if cols else df_pos_view.copy()
+    st.dataframe(view, use_container_width=True, hide_index=True)
 
-    if "missing_mark_price" in pos_view.columns:
-        missing = int(pos_view["missing_mark_price"].sum())
+    if "missing_mark_or_value" in view.columns:
+        missing = int(view["missing_mark_or_value"].sum())
         if missing:
-            st.info(f"{missing} position rows have no mark price/value from the API, so PnL is not scored (neutral).")
+            st.info(f"{missing} position rows have no mark/value from the API, so they’re shown without valuation.")
 
 if show_raw:
-    with st.expander("Raw positions JSON"):
+    with st.expander("Raw positions JSON (BTC/ETH filtered)"):
         st.json(positions_payload)
 
 # ----------------------------
 # Trades
 # ----------------------------
-st.markdown("## Trades")
-trades_payload = []
-trades_error = None
-try:
-    trades_payload = fetch_json(
-        f"{DATA_API_BASE}/trades",
-        params={trades_param_mode: wallet, "limit": trades_limit},
-    )
-except Exception as e:
-    trades_error = str(e)
-    trades_payload = []
-
-if isinstance(trades_payload, dict) and "data" in trades_payload:
-    trades_payload = trades_payload["data"]
-
-if trades_error:
-    st.warning(f"Trades fetch issue: {trades_error}")
-
+st.markdown("## Activity / Trades (BTC/ETH only)")
 if not trades_payload:
-    st.warning("No trades returned (try switching Trades API param in the sidebar).")
+    st.info("No BTC/ETH trades returned (try switching Trades API param in the sidebar).")
 else:
     df_trades = pd.DataFrame(trades_payload)
-
-    hedged_conds = hedged_condition_ids_from_positions(df_pos_raw)
-    t_cond = pick_first_existing_col(df_trades, ["conditionId", "condition_id", "marketId", "market"])
-    if t_cond:
-        df_trades["_cond"] = df_trades[t_cond].astype(str)
-        df_trades["hedged_market_now"] = df_trades["_cond"].apply(lambda x: x in hedged_conds)
-    else:
-        df_trades["hedged_market_now"] = None
 
     for ts_col in ["timestamp", "createdAt"]:
         if ts_col in df_trades.columns:
@@ -581,23 +491,13 @@ else:
         "side",
         "price",
         "size",
-        "hedged_market_now",
         "txHash",
     ]
     tcols = [c for c in preferred_trade_cols if c in df_trades.columns]
-
-    tab1, tab2 = st.tabs(["All Trades", "Non-Hedged Trades"])
-    with tab1:
-        st.dataframe(df_trades[tcols] if tcols else df_trades, use_container_width=True, hide_index=True)
-    with tab2:
-        if "hedged_market_now" in df_trades.columns:
-            non = df_trades[df_trades["hedged_market_now"] != True]
-            st.dataframe(non[tcols] if tcols else non, use_container_width=True, hide_index=True)
-        else:
-            st.info("Cannot tag hedged/non-hedged (missing condition/market id field).")
+    st.dataframe(df_trades[tcols] if tcols else df_trades, use_container_width=True, hide_index=True)
 
 if show_raw:
-    with st.expander("Raw trades JSON"):
+    with st.expander("Raw trades JSON (BTC/ETH filtered)"):
         st.json(trades_payload)
 
 st.caption("Reached end of script ✅")
