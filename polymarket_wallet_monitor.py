@@ -12,7 +12,7 @@ import streamlit as st
 st.set_page_config(page_title="Polymarket Wallet Monitor", page_icon="📈", layout="wide")
 
 DATA_API_BASE = "https://data-api.polymarket.com"
-USER_AGENT = "wallet-monitor/2.0"
+USER_AGENT = "wallet-monitor/2.1"
 HISTORY_DIR = os.path.join(os.getcwd(), "wallet_history")  # cloud-friendly-ish (still ephemeral on redeploy)
 
 session = requests.Session()
@@ -48,7 +48,6 @@ def is_btc_or_eth_item(item: dict) -> bool:
         item.get("slug"),
     ]
 
-    # Sometimes "market" is a dict or an id; handle both
     m = item.get("market")
     if isinstance(m, str):
         fields_to_check.append(m)
@@ -83,6 +82,7 @@ def fetch_json(url: str, params: dict | None = None, timeout: int = 15):
     return r.json()
 
 
+# Streamlit-cache wrappers (short TTL; reduces rerun spam)
 @st.cache_data(ttl=7)
 def cached_positions(wallet: str):
     return fetch_json(f"{DATA_API_BASE}/positions", params={"user": wallet})
@@ -155,7 +155,7 @@ def load_history(wallet: str) -> pd.DataFrame:
 # ----------------------------
 def compute_positions_value(df_pos_raw: pd.DataFrame) -> float | None:
     """
-    Returns best-effort open positions value in USD.
+    Best-effort open positions value in USD.
     Prefer explicit "value/currentValue/usdValue"; else size*curPrice if available.
     """
     if df_pos_raw.empty:
@@ -167,13 +167,11 @@ def compute_positions_value(df_pos_raw: pd.DataFrame) -> float | None:
 
     w = df_pos_raw.copy()
 
-    # 1) Explicit values
     if value_col and value_col in w.columns:
         vals = w[value_col].apply(safe_float).dropna()
         if not vals.empty:
             return float(vals.sum())
 
-    # 2) size * current price
     if size_col and cur_col and (size_col in w.columns) and (cur_col in w.columns):
         w["_size"] = w[size_col].apply(safe_float)
         w["_cur"] = w[cur_col].apply(safe_float)
@@ -182,14 +180,13 @@ def compute_positions_value(df_pos_raw: pd.DataFrame) -> float | None:
         if not tmp.empty:
             return float((tmp["_size"] * tmp["_cur"]).sum())
 
-    # 3) Unknown
     return None
 
 
 def enrich_positions_table(df_pos_raw: pd.DataFrame) -> pd.DataFrame:
     """
     Display-only: adds current_value_usd when possible and a missing flag.
-    No scary PnL math here.
+    No cost-basis / scary PnL math.
     """
     if df_pos_raw.empty:
         return df_pos_raw
@@ -234,11 +231,11 @@ def timeframe_start(ts_now: datetime, tf: str) -> datetime | None:
 
 def compute_pl_from_history(hist: pd.DataFrame, now_value: float | None, ts_now: datetime, tf: str):
     """
-    Profit/Loss over timeframe = now_value - value_at_or_before(start_time)
-    Uses nearest snapshot at/before start_time. If none exists, uses earliest available.
+    P/L over timeframe = now_value - value_at_or_before(start_time).
+    Uses nearest snapshot at/before start_time; else earliest available.
     """
     if now_value is None or hist.empty:
-        return None, None  # (pl_usd, anchor_value)
+        return None, None
 
     start = timeframe_start(ts_now, tf)
     if start is None:
@@ -246,12 +243,10 @@ def compute_pl_from_history(hist: pd.DataFrame, now_value: float | None, ts_now:
         anchor_value = float(anchor_row["portfolio_value_usd"])
         return now_value - anchor_value, anchor_value
 
-    # snapshots at/before start
     subset = hist[hist["timestamp_utc"] <= start]
     if not subset.empty:
         anchor_row = subset.iloc[-1]
     else:
-        # no snapshot that old; fall back to earliest we have
         anchor_row = hist.iloc[0]
 
     anchor_value = float(anchor_row["portfolio_value_usd"])
@@ -260,7 +255,7 @@ def compute_pl_from_history(hist: pd.DataFrame, now_value: float | None, ts_now:
 
 def biggest_win_from_history(hist: pd.DataFrame) -> float | None:
     """
-    "Biggest Win" proxy: biggest positive jump between consecutive snapshots.
+    Proxy: biggest positive jump between consecutive snapshots.
     """
     if hist is None or hist.empty or len(hist) < 2:
         return None
@@ -277,12 +272,13 @@ def biggest_win_from_history(hist: pd.DataFrame) -> float | None:
 # UI
 # ----------------------------
 st.title("📈 Polymarket Wallet Monitor (BTC/ETH Only)")
-st.caption("Accurate tracking via portfolio value change (no scary lifetime PnL guesses).")
+st.caption("Accurate tracking via portfolio value change (no lifetime PnL guesses).")
 
 with st.sidebar:
     wallet = st.text_input("Wallet address (0x...)", value="", placeholder="0x1234...")
     trades_limit = st.slider("Recent trades to show", 10, 500, 150)
     trades_param_mode = st.selectbox("Trades API param", ["user", "proxyWallet"], index=0)
+
     auto_refresh = st.toggle("Auto refresh", value=False)
     refresh_seconds = st.slider("Auto refresh (seconds)", 5, 120, 15)
     show_raw = st.toggle("Show raw JSON (debug)", value=False)
@@ -349,9 +345,8 @@ if positions_value_now is not None:
 hist = load_history(wallet)
 
 # ----------------------------
-# Header metrics (like screenshot vibe)
+# Header metrics (screenshot vibe)
 # ----------------------------
-# predictions: count unique markets traded (in the current fetched window)
 predictions_count = 0
 if trades_payload:
     df_t_tmp = pd.DataFrame(trades_payload)
@@ -376,7 +371,6 @@ with tf_cols[3]:
 with tf_cols[4]:
     tf_all = st.button("ALL")
 
-# store selected timeframe in session
 if "tf" not in st.session_state:
     st.session_state["tf"] = "1D"
 if tf_1d:
@@ -392,8 +386,8 @@ tf = st.session_state["tf"]
 
 pl_usd, anchor_value = compute_pl_from_history(hist, positions_value_now, ts, tf)
 
-# Top row: profile-ish summary + P/L card
-left, right = st.columns([1.2, 1.8], vertical_alignment="top")
+# Two main cards
+left, right = st.columns([1.2, 1.8])  # ✅ no vertical_alignment (older streamlit-safe)
 
 with left:
     st.markdown("### Wallet")
@@ -414,13 +408,12 @@ with right:
     st.markdown(f"### Profit / Loss ({tf})")
     if pl_usd is None:
         st.metric("P/L", "N/A")
-        st.caption("Not enough history yet. Click refresh a few times over time to build snapshots.")
+        st.caption("Not enough history yet. Refresh over time to build snapshots.")
     else:
         st.metric("P/L", f"${pl_usd:,.2f}")
         if anchor_value is not None:
             st.caption(f"Computed as: value now − value at start of window (anchor ${anchor_value:,.2f}).")
 
-    # Chart: portfolio value over selected window
     if not hist.empty:
         chart = hist.copy().set_index("timestamp_utc")
         start = timeframe_start(ts, tf)
@@ -466,7 +459,7 @@ if show_raw:
         st.json(positions_payload)
 
 # ----------------------------
-# Trades
+# Trades table
 # ----------------------------
 st.markdown("## Activity / Trades (BTC/ETH only)")
 if not trades_payload:
